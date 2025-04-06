@@ -37,6 +37,12 @@ android {
     buildFeatures {
         compose = true
     }
+    packaging {
+        jniLibs.pickFirsts.add("lib/armeabi-v7a/libjnidispatch.so")
+        jniLibs.pickFirsts.add("lib/arm64-v8a/libjnidispatch.so")
+        jniLibs.pickFirsts.add("lib/x86/libjnidispatch.so")
+        jniLibs.pickFirsts.add("lib/x86_64/libjnidispatch.so")
+    }
 }
 
 dependencies {
@@ -64,4 +70,7 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.logging.interceptor)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.beacon)
+    implementation(libs.vosk)
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
 }

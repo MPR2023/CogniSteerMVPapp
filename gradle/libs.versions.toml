@@ -12,6 +12,9 @@ composeBom = "2024.09.00"
 loggingInterceptor = "4.10.0"
 okhttp = "4.10.0"
 retrofit = "2.9.0"
+beacon = "2.19.2"
+vosk = "0.3.32"  # or the latest stable version
+
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -32,8 +35,12 @@ androidx-material3 = { group = "androidx.compose.material3", name = "material3" 
 logging-interceptor = { module = "com.squareup.okhttp3:logging-interceptor", version.ref = "loggingInterceptor" }
 okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
 retrofit = { module = "com.squareup.retrofit2:retrofit", version.ref = "retrofit" }
+beacon = { module = "org.altbeacon:android-beacon-library", version.ref = "beacon" }
+vosk = { module = "com.alphacephei:vosk-android", version.ref = "vosk" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+
+
