@@ -12,6 +12,8 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.RemoteException
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -20,48 +22,100 @@ import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
-import com.example.cognisteermvp.ui.theme.CogniSteerMVPTheme
+import androidx.compose.ui.unit.dp
 import com.example.cognisteermvp.api.RetrofitClient
+import com.example.cognisteermvp.api.QueryRequest
+import com.example.cognisteermvp.ui.theme.CogniSteerMVPTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.delay
 import org.altbeacon.beacon.BeaconConsumer
 import org.altbeacon.beacon.BeaconManager
 import org.altbeacon.beacon.BeaconParser
 import org.altbeacon.beacon.Region
+import org.json.JSONException
+import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
 import java.io.File
 import java.io.FileOutputStream
 import android.content.res.AssetManager
 import android.annotation.SuppressLint
-import android.speech.tts.TextToSpeech
 import java.util.Locale
-import com.example.cognisteermvp.api.QueryRequest
-import org.json.JSONObject
-import org.json.JSONException
+import androidx.compose.runtime.Composable
+import kotlinx.coroutines.Job
+
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var tts: TextToSpeech
+    // Flag for voice recognition state and capturing query
     private var isCapturingQuery = false
     private val queryBuffer = StringBuilder()
     private var isScanning = false
     private var lastQueryUpdateTime = 0L
+    // Mutable state holds the dynamic prompt text for the UI.
+    private var promptText by mutableStateOf("Welcome to CogniSteer!")
+    // Flag to indicate whether TTS is currently speaking.
+    private var isTtsSpeaking = false
+    private var currentZone: String? = null
+    private var currentTtsType: String? = null
+    private var lastPromptTime = 0L
+    private var lastWakeTtsTime = 0L
+    private var lastTtsUtterance: String? = null
+    private var ignoreVoiceInput: Boolean = false
+    // New flag to track if waiting for yes/no response after beacon prompt
+    private var isWaitingForBeaconResponse: Boolean = false
+    private var beaconResponseTimeoutJob: Job? = null
+
 
     companion object {
         private const val PERMISSION_REQUEST_CODE = 1001
         private const val AUDIO_PERMISSION_REQUEST_CODE = 2001
         private const val BLUETOOTH_PERMISSION_REQUEST_CODE = 3001
         private const val QUERY_TIMEOUT_MS = 2000L // 2 seconds timeout
+        private const val DEBOUNCE_TIMEOUT = 30000L // 30 seconds in milliseconds
+        private const val WAKE_TTS_GRACE_PERIOD = 3000L // 1.5 seconds, adjust as needed
+        private const val MIN_INPUT_LENGTH = 10
+    }
+
+    // Helper to extract recognized text from Vosk JSON output
+    private fun extractRecognizedText(jsonString: String): String {
+        return try {
+            val jsonObj = JSONObject(jsonString)
+            when {
+                jsonObj.has("text") && jsonObj.getString("text").isNotBlank() -> jsonObj.getString("text")
+                jsonObj.has("partial") && jsonObj.getString("partial").isNotBlank() -> jsonObj.getString("partial")
+                else -> ""
+            }
+        } catch (e: JSONException) {
+            jsonString
+        }
+    }
+
+    // Yes/no helper functions
+    private fun isYesResponse(input: String): Boolean {
+        val normalized = input.trim().toLowerCase(Locale.ROOT)
+        return normalized == "yes" || normalized == "yeah" || normalized == "yup" ||
+                normalized == "sure" || normalized == "okay" || normalized == "ok" ||
+                normalized.contains("yes")
+    }
+
+    private fun isNoResponse(input: String): Boolean {
+        val normalized = input.trim().toLowerCase(Locale.ROOT)
+        return normalized == "no" || normalized == "nope"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,14 +124,19 @@ class MainActivity : ComponentActivity() {
         setContent {
             CogniSteerMVPTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Greeting(
-                        name = "Android",
-                        modifier = Modifier.padding(innerPadding)
-                    )
+                    Column(modifier = Modifier
+                        .padding(innerPadding)
+                        .padding(16.dp)) {
+                        Text(
+                            text = promptText,
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
                 }
             }
         }
 
+        // Initialize TTS with an utterance progress listener.
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 val result = tts.setLanguage(Locale.US)
@@ -85,28 +144,43 @@ class MainActivity : ComponentActivity() {
                     Log.e("TTS", "Language not supported")
                 } else {
                     Log.d("TTS", "TextToSpeech initialized")
+                    tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) {
+                            isTtsSpeaking = true
+                            Log.d("TTS", "TTS started: $utteranceId")
+                        }
+                        override fun onDone(utteranceId: String?) {
+                            isTtsSpeaking = false
+                            ignoreVoiceInput = false // Reset flag when TTS is done
+                            // REMOVE THIS BLOCK:
+                            // if (utteranceId == "beaconPrompt") {
+                            //     isWaitingForBeaconResponse = false
+                            // }
+                            Log.d("TTS", "TTS done: $utteranceId")
+                        }
+                        override fun onError(utteranceId: String?) {
+                            isTtsSpeaking = false
+                            ignoreVoiceInput = false // Reset flag on error
+                            // Reset beacon response flag if this was a beacon prompt
+                            if (utteranceId == "beaconPrompt") {
+                                isWaitingForBeaconResponse = false
+                            }
+                            Log.e("TTS", "TTS error: $utteranceId")
+                        }
+                    })
                 }
             } else {
                 Log.e("TTS", "Initialization failed")
             }
         }
 
+        // Request Bluetooth permissions for Android 12+.
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.BLUETOOTH_SCAN
-                ) != PackageManager.PERMISSION_GRANTED ||
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.BLUETOOTH_CONNECT
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
                 ActivityCompat.requestPermissions(
                     this,
-                    arrayOf(
-                        Manifest.permission.BLUETOOTH_SCAN,
-                        Manifest.permission.BLUETOOTH_CONNECT
-                    ),
+                    arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT),
                     BLUETOOTH_PERMISSION_REQUEST_CODE
                 )
             } else {
@@ -114,34 +188,20 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Request location permissions needed for BLE scanning
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED ||
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
+        // Request location permissions needed for BLE scanning.
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(
                 this,
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
-                ),
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
                 PERMISSION_REQUEST_CODE
             )
         } else {
             initializeBeaconManager()
         }
 
-        // Request RECORD_AUDIO permission for voice recognition
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
+        // Request RECORD_AUDIO permission for voice recognition.
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(
                 this,
                 arrayOf(Manifest.permission.RECORD_AUDIO),
@@ -151,7 +211,7 @@ class MainActivity : ComponentActivity() {
             startVoiceRecognition()
         }
 
-        // Call /health endpoint using Retrofit
+        // Call /health endpoint using Retrofit.
         lifecycleScope.launch {
             try {
                 val response = RetrofitClient.api.checkHealth()
@@ -170,21 +230,78 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Initialize BeaconManager for BLE scanning using the Android Beacon Library
     private fun initializeBeaconManager() {
         Log.d("MainActivity", "Initializing BeaconManager for BLE scanning")
         val beaconManager = BeaconManager.getInstanceForApplication(this)
         val iBeaconLayout = "m:2-3=0215,i:4-19,i:20-21,i:22-23,p:24-24"
-
         beaconManager.beaconParsers.clear()
         beaconManager.beaconParsers.add(BeaconParser().setBeaconLayout(iBeaconLayout))
 
         beaconManager.bind(object : BeaconConsumer {
+            override fun getApplicationContext(): Context = this@MainActivity
+            override fun unbindService(serviceConnection: ServiceConnection) {
+                this@MainActivity.unbindService(serviceConnection)
+            }
+            override fun bindService(intent: Intent, serviceConnection: ServiceConnection, flags: Int): Boolean {
+                return this@MainActivity.bindService(intent, serviceConnection, flags)
+            }
             override fun onBeaconServiceConnect() {
                 beaconManager.addRangeNotifier { beacons, _ ->
                     if (beacons.isNotEmpty()) {
-                        Log.d("MainActivity", "Beacons found: ${beacons.joinToString { it.id1.toString() }}")
+                        for (beacon in beacons) {
+                            val uuid = beacon.id1.toString()
+                            val major = beacon.id2.toInt()
+                            val minor = beacon.id3.toInt()
+                            Log.d("MainActivity", "Detected beacon: UUID=$uuid, Major=$major, Minor=$minor")
+                            val areaName = mapBeaconToArea(uuid, major, minor)
+                            if (areaName != null) {
+                                Log.d("MainActivity", "Mapped beacon to area: $areaName")
+                                val currentTime = System.currentTimeMillis()
+                                if (areaName != currentZone || (currentTime - lastPromptTime) > DEBOUNCE_TIMEOUT) {
+                                    currentZone = areaName
+                                    lastPromptTime = currentTime
+                                    runOnUiThread {
+                                        promptText =
+                                            "Welcome user, you are in the $areaName. Do you need assistance with any protocols and procedures?"
+                                        lastTtsUtterance = promptText
+                                        ignoreVoiceInput = true
+                                        isWaitingForBeaconResponse = true // Expect yes/no response
+
+                                        // --- Add the timeout logic here ---
+                                        beaconResponseTimeoutJob?.cancel()
+                                        beaconResponseTimeoutJob = lifecycleScope.launch {
+                                            delay(10000) // 10 seconds
+                                            if (isWaitingForBeaconResponse) {
+                                                Log.d(
+                                                    "VoiceRecognition",
+                                                    "Timeout waiting for yes/no response"
+                                                )
+                                                isWaitingForBeaconResponse = false
+                                            }
+                                        }
+                                        // --- End timeout logic ---
+
+                                        tts.speak(
+                                            promptText,
+                                            TextToSpeech.QUEUE_FLUSH,
+                                            null,
+                                            "beaconPrompt"
+                                        )
+                                    }
+                                }else {
+                                    Log.d("MainActivity", "Same zone and within debounce period; not re-triggering the prompt.")
+                                }
+                                break
+                            } else {
+                                Log.d("MainActivity", "Beacon does not map to any known area: UUID=$uuid, Major=$major, Minor=$minor")
+                            }
+                        }
                     } else {
+                        // No beacons found: reset the current zone
+                        if (currentZone != null) {
+                            Log.d("MainActivity", "No beacons found; resetting current zone.")
+                            currentZone = null
+                        }
                         Log.d("MainActivity", "No beacons found in range.")
                     }
                 }
@@ -201,27 +318,9 @@ class MainActivity : ComponentActivity() {
                     Log.e("MainActivity", "Error starting beacon ranging: ${e.localizedMessage}")
                 }
             }
-
-            override fun getApplicationContext(): Context = this@MainActivity
-
-            override fun unbindService(p0: ServiceConnection?) {
-                if (p0 != null) {
-                    this@MainActivity.unbindService(p0)
-                }
-            }
-
-            override fun bindService(intent: Intent?, serviceConnection: ServiceConnection, flags: Int): Boolean {
-                return if (intent != null) {
-                    this@MainActivity.bindService(intent, serviceConnection, flags)
-                } else {
-                    false
-                }
-            }
         })
     }
 
-    // Function to start offline voice recognition using Vosk.
-    // It copies the Vosk model from assets (if needed) and then initializes the model.
     @SuppressLint("MissingPermission")
     private fun startVoiceRecognition() {
         lifecycleScope.launch(Dispatchers.IO) {
@@ -236,28 +335,24 @@ class MainActivity : ComponentActivity() {
                 val model = Model(modelDir.absolutePath)
                 val sampleRate = 16000
                 val recognizer = Recognizer(model, sampleRate.toFloat())
-
-                val bufferSize = AudioRecord.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                val audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
-                )
+                val bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize)
                 audioRecord.startRecording()
                 Log.d("VoiceRecognition", "AudioRecord started")
                 val buffer = ByteArray(bufferSize)
-
                 var wakeWordDetected = false
 
                 while (true) {
-                    // Check for query capture timeout at the start of each iteration.
-                    if (isCapturingQuery && queryBuffer.isNotEmpty() && System.currentTimeMillis() - lastQueryUpdateTime > QUERY_TIMEOUT_MS) {
+                    Log.d("VoiceRecognition", "State: isTtsSpeaking=$isTtsSpeaking, isWaitingForBeaconResponse=$isWaitingForBeaconResponse, currentTtsType=$currentTtsType")
+                    // Skip voice processing if TTS is speaking and ignoreVoiceInput is true
+                    if (ignoreVoiceInput && isTtsSpeaking) {
+                        Log.d("VoiceRecognition", "Ignoring voice input while TTS is speaking")
+                        delay(100) // Small delay to prevent tight loop
+                        continue
+                    }
+
+                    if (isCapturingQuery && queryBuffer.isNotEmpty() &&
+                        System.currentTimeMillis() - lastQueryUpdateTime > QUERY_TIMEOUT_MS) {
                         val finalQuery = queryBuffer.toString().trim()
                         Log.d("VoiceRecognition", "Query capture timeout reached, final query: $finalQuery")
                         isCapturingQuery = false
@@ -267,15 +362,91 @@ class MainActivity : ComponentActivity() {
 
                     val read = audioRecord.read(buffer, 0, buffer.size)
                     if (read > 0) {
+                        // Add this check to properly identify beacon prompt responses
+                        if (!isTtsSpeaking && isWaitingForBeaconResponse) {
+                            val inputText = extractRecognizedText(recognizer.partialResult).trim()
+                            if (isYesResponse(inputText)) {
+                                Log.d("VoiceRecognition", "Detected 'yes' response for beacon prompt after TTS finished")
+                                isWaitingForBeaconResponse = false
+                                queryBuffer.clear()
+                                val queryText = "Fetch protocol for $currentZone"
+                                withContext(Dispatchers.Main) {
+                                    lastTtsUtterance = "Fetching protocol for $currentZone"
+                                    ignoreVoiceInput = true
+                                    tts.speak(lastTtsUtterance, TextToSpeech.QUEUE_FLUSH, null, "beaconYesResponse")
+                                }
+                                sendQueryToBackend(queryText, currentZone)
+                                continue
+                            }
+                        }
+                        if (isTtsSpeaking) {
+                            // Handle yes/no responses for beacon prompt
+                            if (isWaitingForBeaconResponse && currentTtsType == "beaconPrompt") {
+                                val inputText = extractRecognizedText(recognizer.partialResult).trim()
+                                if (isYesResponse(inputText)) {
+                                    Log.d("VoiceRecognition", "Detected 'yes' response for beacon prompt")
+                                    tts.stop()
+                                    isTtsSpeaking = false
+                                    isWaitingForBeaconResponse = false
+                                    queryBuffer.clear()
+                                    val queryText = "Fetch protocol for $currentZone"
+                                    withContext(Dispatchers.Main) {
+                                        lastTtsUtterance = "Fetching protocol for $currentZone"
+                                        ignoreVoiceInput = true
+                                        tts.speak(lastTtsUtterance, TextToSpeech.QUEUE_FLUSH, null, "beaconYesResponse")
+                                    }
+                                    sendQueryToBackend(queryText, currentZone)
+                                    continue
+                                } else if (isNoResponse(inputText)) {
+                                    Log.d("VoiceRecognition", "Detected 'no' response for beacon prompt")
+                                    tts.stop()
+                                    isTtsSpeaking = false
+                                    isWaitingForBeaconResponse = false
+                                    queryBuffer.clear()
+                                    withContext(Dispatchers.Main) {
+                                        lastTtsUtterance = "Okay, standing by."
+                                        ignoreVoiceInput = true
+                                        tts.speak(lastTtsUtterance, TextToSpeech.QUEUE_FLUSH, null, "beaconNoResponse")
+                                    }
+                                    continue
+                                } else {
+                                    Log.d("VoiceRecognition", "Ignoring non-yes/no input during beacon prompt TTS")
+                                    continue
+                                }
+                            }
+                            // Handle yes/no responses during queryResponse TTS
+                            if (currentTtsType == "queryResponse") {
+                                val inputText = extractRecognizedText(recognizer.partialResult).trim()
+                                if (isYesResponse(inputText) || isNoResponse(inputText)) {
+                                    Log.d("VoiceRecognition", "Detected yes/no response during query response: $inputText")
+                                    tts.stop()
+                                    isTtsSpeaking = false
+                                    queryBuffer.clear()
+                                    sendQueryToBackend(inputText)
+                                } else {
+                                    Log.d("VoiceRecognition", "Ignoring non-yes/no input during query response TTS")
+                                    continue
+                                }
+                            } else {
+                                // Ignore all input during other TTS types (e.g., wake word prompt)
+                                Log.d("VoiceRecognition", "Ignoring input during TTS (type: $currentTtsType)")
+                                continue
+                            }
+                        }
+
                         if (recognizer.acceptWaveForm(buffer, read)) {
                             val result = recognizer.result
                             Log.d("VoiceRecognition", "Result: $result")
                             if (!wakeWordDetected && result.toLowerCase(Locale.ROOT).contains("hello")) {
                                 wakeWordDetected = true
+                                lastWakeTtsTime = System.currentTimeMillis()
+                                currentTtsType = "wakeWord"
                                 withContext(Dispatchers.Main) {
-                                    tts.speak("How may I assist you?", TextToSpeech.QUEUE_FLUSH, null, "wakeWord")
+                                    lastTtsUtterance = "How may I assist you?"
+                                    ignoreVoiceInput = true
+                                    tts.speak(lastTtsUtterance, TextToSpeech.QUEUE_FLUSH, null, "wakeWord")
                                 }
-                                Log.d("VoiceRecognition", "Wake word detected!")
+                                Log.d("VoiceRecognition", "Wake word detected! TTS started for wake word.")
                                 launch {
                                     delay(5000)
                                     wakeWordDetected = false
@@ -284,28 +455,15 @@ class MainActivity : ComponentActivity() {
                                     Log.d("VoiceRecognition", "Switched to query capture mode")
                                 }
                             } else if (isCapturingQuery) {
-                                queryBuffer.append(" ").append(result.trim())
+                                queryBuffer.append(" ").append(extractRecognizedText(result).trim())
                                 lastQueryUpdateTime = System.currentTimeMillis()
                                 Log.d("VoiceRecognition", "Query Buffer: $queryBuffer")
-                                if (queryBuffer.length > 10) { // Adjust threshold as needed
+                                if (queryBuffer.length > 10) {
                                     val finalQuery = queryBuffer.toString().trim()
-                                    // Extract plain text from the JSON output if available.
-                                    val finalQueryText = try {
-                                        val jsonResult = JSONObject(finalQuery)
-                                        when {
-                                            jsonResult.has("text") && jsonResult.getString("text").isNotBlank() ->
-                                                jsonResult.getString("text")
-                                            jsonResult.has("partial") && jsonResult.getString("partial").isNotBlank() ->
-                                                jsonResult.getString("partial")
-                                            else -> finalQuery
-                                        }
-                                    } catch (e: JSONException) {
-                                        finalQuery
-                                    }
-                                    Log.d("VoiceRecognition", "Final query captured: $finalQueryText")
+                                    Log.d("VoiceRecognition", "Final query captured: $finalQuery")
                                     isCapturingQuery = false
                                     queryBuffer.clear()
-                                    sendQueryToBackend(finalQueryText)
+                                    sendQueryToBackend(finalQuery)
                                 }
                             }
                         } else {
@@ -314,7 +472,9 @@ class MainActivity : ComponentActivity() {
                             if (!wakeWordDetected && partial.toLowerCase(Locale.ROOT).contains("hello")) {
                                 wakeWordDetected = true
                                 withContext(Dispatchers.Main) {
-                                    tts.speak("How may I assist you?", TextToSpeech.QUEUE_FLUSH, null, "wakeWord")
+                                    lastTtsUtterance = "How may I assist you?"
+                                    ignoreVoiceInput = true
+                                    tts.speak(lastTtsUtterance, TextToSpeech.QUEUE_FLUSH, null, "wakeWord")
                                 }
                                 Log.d("VoiceRecognition", "Wake word detected (partial)!")
                                 launch {
@@ -325,37 +485,18 @@ class MainActivity : ComponentActivity() {
                                     Log.d("VoiceRecognition", "Switched to query capture mode")
                                 }
                             } else if (isCapturingQuery) {
-                                queryBuffer.append(" ").append(partial.trim())
+                                queryBuffer.append(" ").append(extractRecognizedText(partial).trim())
                                 lastQueryUpdateTime = System.currentTimeMillis()
                                 Log.d("VoiceRecognition", "Query Buffer: $queryBuffer")
-                                if (queryBuffer.length > 10) { // Adjust threshold as needed
+                                if (queryBuffer.length > 10) {
                                     val finalQuery = queryBuffer.toString().trim()
-                                    val finalQueryText = try {
-                                        val jsonResult = JSONObject(finalQuery)
-                                        when {
-                                            jsonResult.has("text") && jsonResult.getString("text").isNotBlank() ->
-                                                jsonResult.getString("text")
-                                            jsonResult.has("partial") && jsonResult.getString("partial").isNotBlank() ->
-                                                jsonResult.getString("partial")
-                                            else -> finalQuery
-                                        }
-                                    } catch (e: JSONException) {
-                                        finalQuery
-                                    }
-                                    Log.d("VoiceRecognition", "Final query captured: $finalQueryText")
+                                    Log.d("VoiceRecognition", "Final query captured: $finalQuery")
                                     isCapturingQuery = false
                                     queryBuffer.clear()
-                                    sendQueryToBackend(finalQueryText)
+                                    sendQueryToBackend(finalQuery)
                                 }
                             }
                         }
-                    }
-                    if (isCapturingQuery && System.currentTimeMillis() - lastQueryUpdateTime > QUERY_TIMEOUT_MS && queryBuffer.isNotEmpty()) {
-                        val finalQuery = queryBuffer.toString().trim()
-                        Log.d("VoiceRecognition", "Query capture timeout reached, final query: $finalQuery")
-                        isCapturingQuery = false
-                        queryBuffer.clear()
-                        sendQueryToBackend(finalQuery)
                     }
                 }
             } catch (e: Exception) {
@@ -365,12 +506,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Helper function to recursively copy an asset folder to a destination path
     private fun copyAssetFolder(assetManager: AssetManager, fromAssetPath: String, toPath: String): Boolean {
         return try {
             val files = assetManager.list(fromAssetPath)
             if (files.isNullOrEmpty()) {
-                // It's a file; copy it
                 copyAssetFile(assetManager, fromAssetPath, toPath)
             } else {
                 val dir = File(toPath)
@@ -389,7 +528,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Helper function to copy a single asset file to a destination path
     private fun copyAssetFile(assetManager: AssetManager, fromAssetPath: String, toPath: String): Boolean {
         return try {
             assetManager.open(fromAssetPath).use { inputStream ->
@@ -451,33 +589,50 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun sendQueryToBackend(query: String) {
+    private fun sendQueryToBackend(query: String, area: String? = null) {
         Log.d("MainActivity", "Sending query to backend: $query")
         lifecycleScope.launch {
             try {
-                val request = QueryRequest(query = query, sessionId = "exampleSession")
+                val request = QueryRequest(
+                    query = query,
+                    area = area,
+                    sessionId = "exampleSession"
+                )
                 val response = RetrofitClient.api.processQuery(request)
-                // Assuming you want to use the first protocol's content:
                 if (response.results.isNotEmpty()) {
                     val protocolContent = response.results[0].content
                     Log.d("MainActivity", "Query response: $protocolContent")
-                    // Use TTS to speak the response on the main thread
+                    currentTtsType = "queryResponse"
                     withContext(Dispatchers.Main) {
+                        lastTtsUtterance = protocolContent
+                        ignoreVoiceInput = true
                         tts.speak(protocolContent, TextToSpeech.QUEUE_FLUSH, null, "queryResponse")
                     }
                 } else {
                     Log.d("MainActivity", "Query response: No results found.")
                     withContext(Dispatchers.Main) {
-                        tts.speak("No results found.", TextToSpeech.QUEUE_FLUSH, null, "queryResponse")
+                        lastTtsUtterance = "No results found."
+                        ignoreVoiceInput = true
+                        tts.speak(lastTtsUtterance, TextToSpeech.QUEUE_FLUSH, null, "queryResponse")
                     }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
                 Log.e("MainActivity", "Error processing query: ${e.localizedMessage}")
                 withContext(Dispatchers.Main) {
-                    tts.speak("I encountered an error processing your request.", TextToSpeech.QUEUE_FLUSH, null, "error")
+                    lastTtsUtterance = "I encountered an error processing your request."
+                    ignoreVoiceInput = true
+                    tts.speak(lastTtsUtterance, TextToSpeech.QUEUE_FLUSH, null, "error")
                 }
             }
+        }
+    }
+
+    private fun mapBeaconToArea(uuid: String, major: Int, minor: Int): String? {
+        return when {
+            uuid.equals("12345678-1234-5678-1234-56789abcdef0", ignoreCase = true) &&
+                    major == 2 && minor == 1 -> "Security Zone"
+            else -> null
         }
     }
 }
@@ -485,7 +640,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun Greeting(name: String, modifier: Modifier = Modifier) {
     Text(
-        text = "Hello $name!",
+        text = "OK $name!",
         modifier = modifier
     )
 }

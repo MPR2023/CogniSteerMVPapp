@@ -73,4 +73,7 @@ dependencies {
     implementation(libs.beacon)
     implementation(libs.vosk)
     implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("org.altbeacon:android-beacon-library:2.19.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.3.9")
+
 }

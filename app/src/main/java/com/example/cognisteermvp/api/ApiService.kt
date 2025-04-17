@@ -21,6 +21,7 @@ data class HealthResponse(
 data class QueryRequest(
     @SerializedName("query") // Ensure this matches the key expected by the backend.
     val query: String,
+    val area: String?,           // <-- newly added field
     @SerializedName("sessionId")
     val sessionId: String
 )
