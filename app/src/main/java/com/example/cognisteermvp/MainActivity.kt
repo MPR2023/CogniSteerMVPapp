@@ -56,6 +56,10 @@ import android.annotation.SuppressLint
 import java.util.Locale
 import androidx.compose.runtime.Composable
 import kotlinx.coroutines.Job
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.Button
+import androidx.compose.ui.Alignment
 
 
 class MainActivity : ComponentActivity() {
@@ -79,6 +83,7 @@ class MainActivity : ComponentActivity() {
     // New flag to track if waiting for yes/no response after beacon prompt
     private var isWaitingForBeaconResponse: Boolean = false
     private var beaconResponseTimeoutJob: Job? = null
+    private var isStandbyMode by mutableStateOf(false)
 
 
     companion object {
@@ -128,9 +133,25 @@ class MainActivity : ComponentActivity() {
                         .padding(innerPadding)
                         .padding(16.dp)) {
                         Text(
-                            text = promptText,
+                            text = if (isStandbyMode) "App is in standby mode" else promptText,
                             style = MaterialTheme.typography.bodyLarge
                         )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Button(
+                            onClick = {
+                                isStandbyMode = !isStandbyMode
+                                if (isStandbyMode) {
+                                    promptText = "App is in standby mode"
+                                    tts.speak("App is now in standby mode", TextToSpeech.QUEUE_FLUSH, null, "standby")
+                                } else {
+                                    promptText = "Welcome to CogniSteer!"
+                                    tts.speak("App is now active", TextToSpeech.QUEUE_FLUSH, null, "active")
+                                }
+                            },
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
+                        ) {
+                            Text(text = if (isStandbyMode) "Exit Standby" else "Enter Standby")
+                        }
                     }
                 }
             }
@@ -247,6 +268,10 @@ class MainActivity : ComponentActivity() {
             }
             override fun onBeaconServiceConnect() {
                 beaconManager.addRangeNotifier { beacons, _ ->
+                    // Skip beacon processing if in standby mode
+                    if (isStandbyMode) {
+                        return@addRangeNotifier
+                    }
                     if (beacons.isNotEmpty()) {
                         for (beacon in beacons) {
                             val uuid = beacon.id1.toString()
@@ -343,6 +368,11 @@ class MainActivity : ComponentActivity() {
                 var wakeWordDetected = false
 
                 while (true) {
+                    // Skip processing if in standby mode
+                    if (isStandbyMode) {
+                        delay(100)
+                        continue
+                    }
                     Log.d("VoiceRecognition", "State: isTtsSpeaking=$isTtsSpeaking, isWaitingForBeaconResponse=$isWaitingForBeaconResponse, currentTtsType=$currentTtsType")
                     // Skip voice processing if TTS is speaking and ignoreVoiceInput is true
                     if (ignoreVoiceInput && isTtsSpeaking) {
